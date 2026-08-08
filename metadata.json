@@ -1,0 +1,6 @@
+{
+  "name": "One Tap Timer",
+  "description": "Automatic one-tap timer with default custom duration, settings, and ringtone options.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
