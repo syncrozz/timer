@@ -2,7 +2,13 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Settings as SettingsIcon } from 'lucide-react';
 import { AppSettings, TimerState } from './types';
 import { BUILT_IN_RINGTONES, soundEngine } from './utils/sound';
-import { backgroundTimer, requestNotificationPermission, sendTimerNotification } from './utils/backgroundTimer';
+import {
+  backgroundTimer,
+  requestNotificationPermission,
+  sendTimerNotification,
+  scheduleServiceWorkerAlarm,
+  cancelServiceWorkerAlarm,
+} from './utils/backgroundTimer';
 import { TimerDisplay } from './components/TimerDisplay';
 import { PresetsBar } from './components/PresetsBar';
 import { SettingsModal } from './components/SettingsModal';
@@ -72,6 +78,11 @@ export default function App() {
             endTimeRef.current = end;
             setTimeLeftSeconds(remaining);
             setTimerState('running');
+            soundEngine.armTimer(
+              settings.ringtoneId,
+              settings.customRingtoneDataUrl,
+              settings.volume
+            );
           } else {
             // Time expired while away
             setTimeLeftSeconds(0);
@@ -82,7 +93,7 @@ export default function App() {
               settings.volume
             );
             if (settings.vibrate) {
-              soundEngine.vibrate([600, 300, 600, 300, 600]);
+              soundEngine.startVibrationLoop([600, 300, 600, 300, 600, 300, 600]);
             }
           }
         }
@@ -95,9 +106,12 @@ export default function App() {
   // Keep browser tab title synchronized with countdown
   useEffect(() => {
     if (timerState === 'running') {
-      const mins = Math.floor(timeLeftSeconds / 60);
+      const hours = Math.floor(timeLeftSeconds / 3600);
+      const mins = Math.floor((timeLeftSeconds % 3600) / 60);
       const secs = timeLeftSeconds % 60;
-      const timeStr = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+      const timeStr = hours > 0
+        ? `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+        : `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
       document.title = `${timeStr} - One Tap Timer`;
     } else if (timerState === 'finished') {
       document.title = '⏰ Masa Tamat! - One Tap Timer';
@@ -163,11 +177,65 @@ export default function App() {
     }
   }, []);
 
+  const triggerAlarm = useCallback(() => {
+    endTimeRef.current = null;
+    try {
+      localStorage.removeItem('pemasa_target_end_time');
+      localStorage.setItem('pemasa_timer_state', 'finished');
+    } catch {}
+
+    setTimeLeftSeconds(0);
+    setTimerState('finished');
+    releaseWakeLock();
+    backgroundTimer.stop();
+
+    soundEngine.playAlarm(
+      settings.ringtoneId,
+      settings.customRingtoneDataUrl,
+      settings.volume
+    );
+
+    if (settings.vibrate) {
+      soundEngine.startVibrationLoop([600, 300, 600, 300, 600, 300, 600]);
+    }
+
+    if (settings.backgroundNotifications) {
+      sendTimerNotification('One Tap Timer', '⏰ Masa telah tamat! Jam penggera sedang berbunyi.');
+    }
+  }, [settings, releaseWakeLock]);
+
+  const handleStopAlarm = useCallback(() => {
+    soundEngine.stop();
+    cancelServiceWorkerAlarm();
+    endTimeRef.current = null;
+    try {
+      localStorage.removeItem('pemasa_target_end_time');
+      localStorage.removeItem('pemasa_timer_state');
+    } catch {}
+    setTimerState('idle');
+    setTimeLeftSeconds(totalDurationSeconds);
+  }, [totalDurationSeconds]);
+
+  // Connect MediaSession lockscreen controls to handleStopAlarm
+  useEffect(() => {
+    soundEngine.setStopHandler(handleStopAlarm);
+    return () => {
+      soundEngine.setStopHandler(null);
+    };
+  }, [handleStopAlarm]);
+
   const startTimer = useCallback((secondsToRun: number) => {
     soundEngine.unlockAudio();
     if (settings.backgroundNotifications) {
       requestNotificationPermission().catch(() => {});
     }
+
+    // Arm audio keep-alive and pre-load chosen alarm tone on this user interaction
+    soundEngine.armTimer(
+      settings.ringtoneId,
+      settings.customRingtoneDataUrl,
+      settings.volume
+    );
 
     const end = Date.now() + secondsToRun * 1000;
     endTimeRef.current = end;
@@ -177,10 +245,19 @@ export default function App() {
       localStorage.setItem('pemasa_timer_state', 'running');
     } catch {}
 
+    // Schedule Service Worker alarm notification fallback
+    scheduleServiceWorkerAlarm(
+      end,
+      'One Tap Timer',
+      '⏰ Masa telah tamat! Jam penggera sedang berbunyi.'
+    );
+
     setTimerState('running');
-  }, [settings.backgroundNotifications, totalDurationSeconds]);
+  }, [settings, totalDurationSeconds]);
 
   const pauseTimer = useCallback(() => {
+    soundEngine.disarmKeepAlive();
+    cancelServiceWorkerAlarm();
     if (endTimeRef.current !== null) {
       const remaining = Math.max(0, Math.ceil((endTimeRef.current - Date.now()) / 1000));
       setTimeLeftSeconds(remaining);
@@ -211,41 +288,27 @@ export default function App() {
 
       setTimeLeftSeconds(remainingSec);
 
+      const hours = Math.floor(remainingSec / 3600);
+      const mins = Math.floor((remainingSec % 3600) / 60);
+      const secs = remainingSec % 60;
+      const timeStr = hours > 0
+        ? `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+        : `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+      soundEngine.updateMediaSessionRunning(timeStr);
+
       if (remainingMs <= 0) {
-        endTimeRef.current = null;
-        try {
-          localStorage.removeItem('pemasa_target_end_time');
-          localStorage.setItem('pemasa_timer_state', 'finished');
-        } catch {}
-
-        setTimerState('finished');
-        releaseWakeLock();
-        backgroundTimer.stop();
-
-        soundEngine.playAlarm(
-          settings.ringtoneId,
-          settings.customRingtoneDataUrl,
-          settings.volume
-        );
-
-        if (settings.vibrate) {
-          soundEngine.vibrate([600, 300, 600, 300, 600]);
-        }
-
-        if (settings.backgroundNotifications) {
-          sendTimerNotification('One Tap Timer', '⏰ Masa telah tamat! Jam penggera sedang berbunyi.');
-        }
+        triggerAlarm();
       }
     };
 
     // Immediate check
     checkTimeRemaining();
 
-    // Start background Web Worker timer (runs even when tab is backgrounded)
-    backgroundTimer.start(checkTimeRemaining);
+    // Start background Web Worker timer with target timestamp
+    backgroundTimer.start(checkTimeRemaining, endTimeRef.current, triggerAlarm);
 
     // Fallback interval on main thread
-    const fallbackInterval = window.setInterval(checkTimeRemaining, 250);
+    const fallbackInterval = window.setInterval(checkTimeRemaining, 200);
 
     // Reconcile immediately upon tab swap, app focus, or visibility change
     const onVisibilityChange = () => {
@@ -277,7 +340,7 @@ export default function App() {
       window.removeEventListener('focus', onWindowFocus);
       window.removeEventListener('pageshow', onWindowFocus);
     };
-  }, [timerState, settings, requestWakeLock, releaseWakeLock, pauseTimer]);
+  }, [timerState, settings, requestWakeLock, releaseWakeLock, pauseTimer, triggerAlarm]);
 
   const handleMainTap = () => {
     if (settings.vibrate) {
@@ -297,19 +360,7 @@ export default function App() {
 
   const handleReset = () => {
     soundEngine.stop();
-    soundEngine.stopVibration();
-    endTimeRef.current = null;
-    try {
-      localStorage.removeItem('pemasa_target_end_time');
-      localStorage.removeItem('pemasa_timer_state');
-    } catch {}
-    setTimerState('idle');
-    setTimeLeftSeconds(totalDurationSeconds);
-  };
-
-  const handleStopAlarm = () => {
-    soundEngine.stop();
-    soundEngine.stopVibration();
+    cancelServiceWorkerAlarm();
     endTimeRef.current = null;
     try {
       localStorage.removeItem('pemasa_target_end_time');
@@ -321,7 +372,7 @@ export default function App() {
 
   const handleRestartTimer = () => {
     soundEngine.stop();
-    soundEngine.stopVibration();
+    cancelServiceWorkerAlarm();
     setTimeLeftSeconds(totalDurationSeconds);
     startTimer(totalDurationSeconds);
   };

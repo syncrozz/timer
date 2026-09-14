@@ -20,8 +20,12 @@ export const TimerDisplay: React.FC<TimerDisplayProps> = ({
   ringtoneName,
 }) => {
   const formatTime = (totalSecs: number) => {
-    const mins = Math.floor(totalSecs / 60);
+    const hours = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
     const secs = totalSecs % 60;
+    if (hours > 0) {
+      return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
@@ -123,7 +127,7 @@ export const TimerDisplay: React.FC<TimerDisplayProps> = ({
           </div>
 
           {/* Time digits - thin elegant frosted typography */}
-          <div className="font-sans text-5xl sm:text-6xl font-light tracking-tighter text-white drop-shadow-xl leading-none">
+          <div className={`font-sans font-light tracking-tighter text-white drop-shadow-xl leading-none ${timeLeftSeconds >= 3600 ? 'text-3xl sm:text-4xl tracking-normal' : 'text-5xl sm:text-6xl'}`}>
             {formatTime(timeLeftSeconds)}
           </div>
 

@@ -49,6 +49,41 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
+let scheduledAlarmTimeout = null;
+
+self.addEventListener('message', (event) => {
+  if (!event.data) return;
+
+  if (event.data.type === 'SCHEDULE_ALARM') {
+    if (scheduledAlarmTimeout) {
+      clearTimeout(scheduledAlarmTimeout);
+      scheduledAlarmTimeout = null;
+    }
+
+    const targetTime = event.data.endTime;
+    const now = Date.now();
+    const delay = Math.max(0, targetTime - now);
+
+    scheduledAlarmTimeout = setTimeout(() => {
+      self.registration.showNotification(event.data.title || 'One Tap Timer', {
+        body: event.data.body || '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',
+        icon: 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/android-chrome-192x192.png',
+        badge: 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon-96x96.png',
+        tag: 'one-tap-timer-finished',
+        requireInteraction: true,
+        vibrate: [600, 300, 600, 300, 600, 300, 600],
+        renotify: true,
+      });
+      scheduledAlarmTimeout = null;
+    }, delay);
+  } else if (event.data.type === 'CANCEL_ALARM') {
+    if (scheduledAlarmTimeout) {
+      clearTimeout(scheduledAlarmTimeout);
+      scheduledAlarmTimeout = null;
+    }
+  }
+});
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   event.waitUntil(

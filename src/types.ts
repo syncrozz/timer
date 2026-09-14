@@ -27,6 +27,7 @@ export interface AppSettings {
 
 export interface TimerPreset {
   label: string;
+  display?: string;
   minutes: number;
   seconds: number;
 }

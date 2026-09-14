@@ -119,7 +119,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <span>Custom Default Duration</span>
               </label>
               <span className="text-xs font-mono font-semibold px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                {minutes}m {seconds > 0 ? `${seconds}s` : ''}
+                {minutes >= 60
+                  ? `${Math.floor(minutes / 60)} Jam${minutes % 60 > 0 ? ` ${minutes % 60}m` : ''}`
+                  : `${minutes}m`} {seconds > 0 ? `${seconds}s` : ''}
               </span>
             </div>
 
@@ -129,16 +131,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
                 {[
                   { m: 1, label: '1m' },
+                  { m: 2, label: '2m' },
                   { m: 3, label: '3m' },
                   { m: 5, label: '5m' },
-                  { m: 9, label: '9m' },
                   { m: 10, label: '10m' },
                   { m: 15, label: '15m' },
                   { m: 20, label: '20m' },
                   { m: 25, label: '25m' },
                   { m: 30, label: '30m' },
-                  { m: 45, label: '45m' },
                   { m: 60, label: '60m' },
+                  { m: 120, label: '2 Jam' },
                 ].map((item) => (
                   <button
                     key={item.m}
@@ -182,14 +184,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       title="Increase 1 minute"
                     >
                       +1
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setMinutes(minutes + 5)}
-                      className="min-w-[38px] h-8 px-2 text-xs font-bold bg-white/10 hover:bg-white/20 active:scale-95 rounded-lg text-white border border-white/15 transition-all cursor-pointer flex items-center justify-center"
-                      title="Increase 5 minutes"
-                    >
-                      +5
                     </button>
                   </div>
                 </div>
