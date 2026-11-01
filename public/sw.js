@@ -64,6 +64,24 @@ self.addEventListener('message', (event) => {
     const now = Date.now();
     const delay = Math.max(0, targetTime - now);
 
+    // Try native OS TimestampTrigger (supported on Android Chrome for exact lockscreen alarm wakeup)
+    try {
+      if (typeof TimestampTrigger !== 'undefined' && 'showTrigger' in Notification.prototype) {
+        self.registration.showNotification(event.data.title || 'One Tap Timer', {
+          body: event.data.body || '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',
+          icon: 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/android-chrome-192x192.png',
+          badge: 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon-96x96.png',
+          tag: 'one-tap-timer-finished',
+          showTrigger: new TimestampTrigger(targetTime),
+          requireInteraction: true,
+          vibrate: [600, 300, 600, 300, 600, 300, 600],
+          renotify: true,
+        });
+      }
+    } catch (e) {
+      // Fallback to standard timer below
+    }
+
     scheduledAlarmTimeout = setTimeout(() => {
       self.registration.showNotification(event.data.title || 'One Tap Timer', {
         body: event.data.body || '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',

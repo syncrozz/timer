@@ -28,6 +28,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [notifPermission, setNotifPermission] = useState(getNotificationPermissionStatus());
   const [theme, setTheme] = useState(settings.theme);
 
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleRequestNotif = async () => {
@@ -65,9 +67,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     
     // Ensure total duration > 0
     if (safeMins === 0 && safeSecs === 0) {
-      alert('Sila tetapkan masa lebih daripada 0 saat.');
+      setErrorMessage('Sila tetapkan masa lebih daripada 0 saat.');
       return;
     }
+    setErrorMessage(null);
 
     onSaveSettings({
       defaultMinutes: safeMins,
@@ -111,6 +114,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Content Body */}
         <div className="p-5 space-y-6 max-h-[75vh] overflow-y-auto">
+          {errorMessage && (
+            <div className="p-3 rounded-2xl bg-rose-500/20 border border-rose-500/40 text-rose-300 text-xs font-semibold flex items-center gap-2">
+              <ShieldAlert className="w-4 h-4 shrink-0 text-rose-400" />
+              <span>{errorMessage}</span>
+            </div>
+          )}
+
           {/* Section 1: Default Duration */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">

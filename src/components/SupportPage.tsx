@@ -66,21 +66,40 @@ export function SupportPage({ onReturn, appName = 'One Tap Timer' }: SupportPage
             }
           } catch (canvasErr) {
             console.error('Canvas export failed:', canvasErr);
-            // Final fallback: open image in new tab
-            window.open(QR_IMAGE_URL, '_blank');
+            const a = document.createElement('a');
+            a.href = QR_IMAGE_URL;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.download = 'QR_Syncrozz_Sumbangan.jpg';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
             setDownloadStatus('error');
             setTimeout(() => setDownloadStatus('idle'), 4000);
           }
         };
         img.onerror = () => {
-          // Open direct URL in new tab for manual saving
-          window.open(QR_IMAGE_URL, '_blank');
+          const a = document.createElement('a');
+          a.href = QR_IMAGE_URL;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.download = 'QR_Syncrozz_Sumbangan.jpg';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
           setDownloadStatus('error');
           setTimeout(() => setDownloadStatus('idle'), 4000);
         };
         img.src = QR_IMAGE_URL;
       } catch {
-        window.open(QR_IMAGE_URL, '_blank');
+        const a = document.createElement('a');
+        a.href = QR_IMAGE_URL;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.download = 'QR_Syncrozz_Sumbangan.jpg';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
         setDownloadStatus('error');
         setTimeout(() => setDownloadStatus('idle'), 4000);
       }

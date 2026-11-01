@@ -14,6 +14,7 @@ import { PresetsBar } from './components/PresetsBar';
 import { SettingsModal } from './components/SettingsModal';
 import { AlarmScreen } from './components/AlarmScreen';
 import { SupportPage } from './components/SupportPage';
+import { screenWakeManager } from './utils/wakeLock';
 
 const DEFAULT_SETTINGS: AppSettings = {
   defaultMinutes: 5,
@@ -53,7 +54,6 @@ export default function App() {
     return typeof window !== 'undefined' && window.location.hash === '#support';
   });
 
-  const wakeLockRef = useRef<WakeLockSentinel | null>(null);
   const endTimeRef = useRef<number | null>(null);
 
   // Restore running timer from localStorage if page was refreshed or restored after background swap
@@ -81,12 +81,24 @@ export default function App() {
             soundEngine.armTimer(
               settings.ringtoneId,
               settings.customRingtoneDataUrl,
-              settings.volume
+              settings.volume,
+              end,
+              () => {
+                setTimeLeftSeconds(0);
+                setTimerState('finished');
+                screenWakeManager.release();
+                soundEngine.playAlarm(
+                  settings.ringtoneId,
+                  settings.customRingtoneDataUrl,
+                  settings.volume
+                );
+              }
             );
           } else {
             // Time expired while away
             setTimeLeftSeconds(0);
             setTimerState('finished');
+            screenWakeManager.release();
             soundEngine.playAlarm(
               settings.ringtoneId,
               settings.customRingtoneDataUrl,
@@ -160,23 +172,6 @@ export default function App() {
     }
   };
 
-  const requestWakeLock = useCallback(async () => {
-    if (settings.keepScreenAwake && 'wakeLock' in navigator) {
-      try {
-        wakeLockRef.current = await navigator.wakeLock.request('screen');
-      } catch (err) {
-        console.warn('Screen wake lock failed:', err);
-      }
-    }
-  }, [settings.keepScreenAwake]);
-
-  const releaseWakeLock = useCallback(() => {
-    if (wakeLockRef.current) {
-      wakeLockRef.current.release().catch(console.warn);
-      wakeLockRef.current = null;
-    }
-  }, []);
-
   const triggerAlarm = useCallback(() => {
     endTimeRef.current = null;
     try {
@@ -186,7 +181,7 @@ export default function App() {
 
     setTimeLeftSeconds(0);
     setTimerState('finished');
-    releaseWakeLock();
+    screenWakeManager.release();
     backgroundTimer.stop();
 
     soundEngine.playAlarm(
@@ -202,10 +197,11 @@ export default function App() {
     if (settings.backgroundNotifications) {
       sendTimerNotification('One Tap Timer', '⏰ Masa telah tamat! Jam penggera sedang berbunyi.');
     }
-  }, [settings, releaseWakeLock]);
+  }, [settings]);
 
   const handleStopAlarm = useCallback(() => {
     soundEngine.stop();
+    screenWakeManager.release();
     cancelServiceWorkerAlarm();
     endTimeRef.current = null;
     try {
@@ -226,19 +222,25 @@ export default function App() {
 
   const startTimer = useCallback((secondsToRun: number) => {
     soundEngine.unlockAudio();
+    if (settings.keepScreenAwake) {
+      screenWakeManager.activate();
+    }
     if (settings.backgroundNotifications) {
       requestNotificationPermission().catch(() => {});
     }
 
-    // Arm audio keep-alive and pre-load chosen alarm tone on this user interaction
+    const end = Date.now() + secondsToRun * 1000;
+    endTimeRef.current = end;
+
+    // Arm audio keep-alive and pre-play chosen alarm tone on this user interaction
     soundEngine.armTimer(
       settings.ringtoneId,
       settings.customRingtoneDataUrl,
-      settings.volume
+      settings.volume,
+      end,
+      triggerAlarm
     );
 
-    const end = Date.now() + secondsToRun * 1000;
-    endTimeRef.current = end;
     try {
       localStorage.setItem('pemasa_target_end_time', String(end));
       localStorage.setItem('pemasa_total_duration', String(totalDurationSeconds));
@@ -253,10 +255,11 @@ export default function App() {
     );
 
     setTimerState('running');
-  }, [settings, totalDurationSeconds]);
+  }, [settings, totalDurationSeconds, triggerAlarm]);
 
   const pauseTimer = useCallback(() => {
     soundEngine.disarmKeepAlive();
+    screenWakeManager.release();
     cancelServiceWorkerAlarm();
     if (endTimeRef.current !== null) {
       const remaining = Math.max(0, Math.ceil((endTimeRef.current - Date.now()) / 1000));
@@ -270,15 +273,16 @@ export default function App() {
     setTimerState('paused');
   }, []);
 
-  // Main countdown engine (Web Worker + timestamp-based delta calculations)
+  // Main countdown engine (Web Worker + audio timeupdate + timestamp-based delta calculations)
   useEffect(() => {
     if (timerState !== 'running' || endTimeRef.current === null) {
       backgroundTimer.stop();
-      releaseWakeLock();
       return;
     }
 
-    requestWakeLock();
+    if (settings.keepScreenAwake) {
+      screenWakeManager.activate();
+    }
 
     const checkTimeRemaining = () => {
       if (endTimeRef.current === null) return;
@@ -316,16 +320,16 @@ export default function App() {
         pauseTimer();
       } else {
         checkTimeRemaining();
-        if (document.visibilityState === 'visible') {
-          requestWakeLock();
+        if (document.visibilityState === 'visible' && settings.keepScreenAwake && timerState === 'running') {
+          screenWakeManager.activate();
         }
       }
     };
 
     const onWindowFocus = () => {
       checkTimeRemaining();
-      if (document.visibilityState === 'visible') {
-        requestWakeLock();
+      if (document.visibilityState === 'visible' && settings.keepScreenAwake && timerState === 'running') {
+        screenWakeManager.activate();
       }
     };
 
@@ -340,26 +344,36 @@ export default function App() {
       window.removeEventListener('focus', onWindowFocus);
       window.removeEventListener('pageshow', onWindowFocus);
     };
-  }, [timerState, settings, requestWakeLock, releaseWakeLock, pauseTimer, triggerAlarm]);
+  }, [timerState, settings, pauseTimer, triggerAlarm]);
 
   const handleMainTap = () => {
+    soundEngine.unlockAudio();
     if (settings.vibrate) {
       soundEngine.vibrate(30);
     }
 
     if (timerState === 'idle') {
+      if (settings.keepScreenAwake) {
+        screenWakeManager.activate();
+      }
       startTimer(totalDurationSeconds);
     } else if (timerState === 'running') {
+      screenWakeManager.release();
       pauseTimer();
     } else if (timerState === 'paused') {
+      if (settings.keepScreenAwake) {
+        screenWakeManager.activate();
+      }
       startTimer(timeLeftSeconds);
     } else if (timerState === 'finished') {
+      screenWakeManager.release();
       handleStopAlarm();
     }
   };
 
   const handleReset = () => {
     soundEngine.stop();
+    screenWakeManager.release();
     cancelServiceWorkerAlarm();
     endTimeRef.current = null;
     try {
@@ -372,6 +386,7 @@ export default function App() {
 
   const handleRestartTimer = () => {
     soundEngine.stop();
+    screenWakeManager.release();
     cancelServiceWorkerAlarm();
     setTimeLeftSeconds(totalDurationSeconds);
     startTimer(totalDurationSeconds);
