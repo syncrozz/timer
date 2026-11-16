@@ -67,18 +67,18 @@ export const BUILT_IN_RINGTONES: RingtoneOption[] = [
 ];
 
 /**
- * Generates an active 10-second 30Hz sub-audible WAV PCM audio buffer.
- * Smartphone micro-speakers physically cannot reproduce 30Hz (< 150Hz cutoff),
- * making it silent to the user, yet the mobile OS audio mixer recognizes it as an active
- * media stream with 35% amplitude, preventing iOS and Android from suspending the timer.
+ * Generates a clean 16-bit 44.1kHz silent WAV PCM audio buffer (pure digital zero).
+ * Keeps the browser/OS audio session, MediaSession, and `ontimeupdate` heartbeat active
+ * in the background without producing any audible hiss, quantization noise, or hum.
  */
-function createSubAudibleWavBlobUrl(): string {
+function createSilentWavBlobUrl(): string {
   try {
-    const sampleRate = 8000;
-    const duration = 10;
+    const sampleRate = 44100;
+    const duration = 5;
     const numChannels = 1;
-    const bitsPerSample = 8;
-    const dataSize = sampleRate * duration;
+    const bitsPerSample = 16;
+    const bytesPerSample = bitsPerSample / 8;
+    const dataSize = sampleRate * duration * numChannels * bytesPerSample;
     const buffer = new ArrayBuffer(44 + dataSize);
     const view = new DataView(buffer);
 
@@ -96,33 +96,27 @@ function createSubAudibleWavBlobUrl(): string {
     view.setUint16(20, 1, true); // PCM
     view.setUint16(22, numChannels, true);
     view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true);
-    view.setUint16(32, numChannels * (bitsPerSample / 8), true);
+    view.setUint32(28, sampleRate * numChannels * bytesPerSample, true);
+    view.setUint16(32, numChannels * bytesPerSample, true);
     view.setUint16(34, bitsPerSample, true);
     writeString(36, 'data');
     view.setUint32(40, dataSize, true);
-
-    const freq = 30; // 30Hz
-    const pcm = new Uint8Array(buffer, 44);
-    for (let i = 0; i < dataSize; i++) {
-      const t = i / sampleRate;
-      pcm[i] = Math.round(128 + 35 * Math.sin(2 * Math.PI * freq * t));
-    }
+    // ArrayBuffer is zero-initialized, producing pure 16-bit digital silence (0x0000)
 
     const blob = new Blob([buffer], { type: 'audio/wav' });
     return URL.createObjectURL(blob);
   } catch (e) {
-    console.warn('Failed to build sub-audible wav blob:', e);
+    console.warn('Failed to build silent wav blob:', e);
     return 'data:audio/wav;base64,UklGRjIAAABXQVZFZm10IBIAAAABAAEAQB8AAEAfAAABAAgAAABmYWN0BAAAAAAAAABkYXRhAAAAAA==';
   }
 }
 
 class SoundEngine {
-  private subAudibleWavUrl: string = '';
+  private silentWavUrl: string = '';
   private keepAliveAudio: HTMLAudioElement | null = null;
   private alarmAudio: HTMLAudioElement | null = null;
   private audioContext: AudioContext | null = null;
-  private keepAliveOsc: OscillatorNode | null = null;
+  private keepAliveSource: AudioBufferSourceNode | null = null;
   private keepAliveGain: GainNode | null = null;
   private fallbackOscInterval: number | null = null;
   private vibrationInterval: number | null = null;
@@ -133,7 +127,7 @@ class SoundEngine {
 
   constructor() {
     if (typeof window !== 'undefined') {
-      this.subAudibleWavUrl = createSubAudibleWavBlobUrl();
+      this.silentWavUrl = createSilentWavBlobUrl();
     }
   }
 
@@ -176,8 +170,8 @@ class SoundEngine {
 
   /**
    * Arms the active background audio keep-alive and preloads alarm tone.
-   * Plays the 30Hz carrier at 35% volume. To the OS mixer, active sound is playing,
-   * so the background timer thread and worker are NEVER suspended.
+   * Plays a pure silent WAV stream and silent Web Audio buffer so the OS keeps
+   * the timer thread active without emitting any audible hiss or hum.
    */
   public armTimer(
     ringtoneId: string,
@@ -191,16 +185,16 @@ class SoundEngine {
     this.onExpiredAction = onExpired || null;
     this.unlockAudio();
 
-    // 1. Start continuous 30Hz carrier audio on loop
+    // 1. Start continuous silent carrier audio on loop
     try {
       if (!this.keepAliveAudio) {
-        this.keepAliveAudio = new Audio(this.subAudibleWavUrl);
+        this.keepAliveAudio = new Audio(this.silentWavUrl);
       }
       this.keepAliveAudio.setAttribute('playsinline', '');
       this.keepAliveAudio.setAttribute('webkit-playsinline', '');
       this.keepAliveAudio.loop = true;
-      // 0.35 volume provides unmistakable active audio signal to OS mixer
-      this.keepAliveAudio.volume = 0.35;
+      // Non-zero volume ensures OS treats stream as unmuted active media, while PCM samples are pure zero
+      this.keepAliveAudio.volume = 0.01;
 
       // Monitor targetEndTime on every OS audio timeupdate
       this.keepAliveAudio.ontimeupdate = () => {
@@ -221,22 +215,30 @@ class SoundEngine {
       console.warn('Keep-alive init warning:', err);
     }
 
-    // 2. Start Web Audio keep-alive node
+    // 2. Start silent Web Audio keep-alive buffer (zero audible signal)
     try {
-      if (this.audioContext && !this.keepAliveOsc) {
-        const osc = this.audioContext.createOscillator();
+      if (this.audioContext && !this.keepAliveSource) {
+        const silentBuffer = this.audioContext.createBuffer(
+          1,
+          this.audioContext.sampleRate,
+          this.audioContext.sampleRate
+        );
+        const source = this.audioContext.createBufferSource();
+        source.buffer = silentBuffer;
+        source.loop = true;
+
         const gain = this.audioContext.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(28, this.audioContext.currentTime); // inaudible 28Hz
-        gain.gain.setValueAtTime(0.15, this.audioContext.currentTime); // non-zero for DSP keep-alive
-        osc.connect(gain);
+        gain.gain.setValueAtTime(0, this.audioContext.currentTime);
+
+        source.connect(gain);
         gain.connect(this.audioContext.destination);
-        osc.start();
-        this.keepAliveOsc = osc;
+        source.start();
+
+        this.keepAliveSource = source;
         this.keepAliveGain = gain;
       }
     } catch (e) {
-      console.warn('Web Audio oscillator keep-alive note:', e);
+      console.warn('Web Audio buffer keep-alive note:', e);
     }
 
     // 3. Pre-load the chosen alarm ringtone so it is ready in memory
@@ -266,12 +268,17 @@ class SoundEngine {
         this.keepAliveAudio.pause();
       } catch {}
     }
-    if (this.keepAliveOsc) {
+    if (this.keepAliveSource) {
       try {
-        this.keepAliveOsc.stop();
-        this.keepAliveOsc.disconnect();
+        this.keepAliveSource.stop();
+        this.keepAliveSource.disconnect();
       } catch {}
-      this.keepAliveOsc = null;
+      this.keepAliveSource = null;
+    }
+    if (this.keepAliveGain) {
+      try {
+        this.keepAliveGain.disconnect();
+      } catch {}
       this.keepAliveGain = null;
     }
   }
