@@ -1,7 +1,10 @@
 /**
- * Background Timer Service
- * Uses Web Worker with precision target-timestamp timeouts to prevent browser
- * throttling when the tab is backgrounded or when phone screen dims.
+ * Background Timer & Notification Service
+ *
+ * Uses a Web Worker for off-main-thread timestamp checks while the browser process
+ * is alive, plus best-effort Service Worker / Web Notification fallbacks.
+ * Note: Mobile browsers (Android Chrome / WebView / iOS) may still suspend or
+ * terminate background tabs and idle Service Workers when the screen locks.
  */
 
 class BackgroundTimerService {
@@ -14,46 +17,68 @@ class BackgroundTimerService {
   }
 
   private initWorker() {
+    if (typeof Worker === 'undefined' || typeof Blob === 'undefined') {
+      this.worker = null;
+      return;
+    }
     try {
       const workerCode = `
         let timerId = null;
         let timeoutId = null;
         let targetEndTime = null;
+        let hasFiredExpired = false;
+
+        function clearTimers() {
+          if (timerId !== null) {
+            clearInterval(timerId);
+            timerId = null;
+          }
+          if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+            timeoutId = null;
+          }
+        }
+
+        function fireExpired() {
+          if (hasFiredExpired) return;
+          hasFiredExpired = true;
+          clearTimers();
+          targetEndTime = null;
+          self.postMessage({ type: 'EXPIRED' });
+        }
 
         self.onmessage = function(e) {
-          if (e.data && e.data.type === 'START') {
-            if (timerId) clearInterval(timerId);
-            if (timeoutId) clearTimeout(timeoutId);
+          if (!e.data) return;
 
+          if (e.data.type === 'START') {
+            clearTimers();
+            hasFiredExpired = false;
             targetEndTime = e.data.targetEndTime || null;
 
-            // Periodic tick every 200ms
+            if (targetEndTime && Date.now() >= targetEndTime) {
+              fireExpired();
+              return;
+            }
+
+            // Periodic tick every 250ms based on wall-clock targetEndTime
             timerId = setInterval(function() {
               const now = Date.now();
               if (targetEndTime && now >= targetEndTime) {
-                self.postMessage({ type: 'EXPIRED' });
+                fireExpired();
               } else {
                 self.postMessage({ type: 'TICK' });
               }
-            }, 200);
+            }, 250);
 
-            // Precision exact millisecond timeout
+            // Precision timeout aligned to targetEndTime
             if (targetEndTime) {
               const delay = Math.max(0, targetEndTime - Date.now());
-              timeoutId = setTimeout(function() {
-                self.postMessage({ type: 'EXPIRED' });
-              }, delay);
+              timeoutId = setTimeout(fireExpired, delay);
             }
-          } else if (e.data && e.data.type === 'STOP') {
-            if (timerId) {
-              clearInterval(timerId);
-              timerId = null;
-            }
-            if (timeoutId) {
-              clearTimeout(timeoutId);
-              timeoutId = null;
-            }
+          } else if (e.data.type === 'STOP') {
+            clearTimers();
             targetEndTime = null;
+            hasFiredExpired = false;
           }
         };
       `;
@@ -64,8 +89,10 @@ class BackgroundTimerService {
       this.worker.onmessage = (e) => {
         if (!e.data) return;
         if (e.data.type === 'EXPIRED') {
-          if (this.onExpiredCallback) {
-            this.onExpiredCallback();
+          const expiredCb = this.onExpiredCallback;
+          this.onExpiredCallback = null;
+          if (expiredCb) {
+            expiredCb();
           } else if (this.onTickCallback) {
             this.onTickCallback();
           }
@@ -98,39 +125,50 @@ class BackgroundTimerService {
 
 export const backgroundTimer = new BackgroundTimerService();
 
-/**
- * Schedule background notification via Service Worker
- */
-export function scheduleServiceWorkerAlarm(endTime: number, title?: string, body?: string) {
+async function postMessageToServiceWorker(message: Record<string, unknown>): Promise<void> {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
   try {
     if (navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage({
-        type: 'SCHEDULE_ALARM',
-        endTime,
-        title: title || 'One Tap Timer',
-        body: body || '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',
-      });
+      navigator.serviceWorker.controller.postMessage(message);
+      return;
     }
+    const registration = await navigator.serviceWorker.ready;
+    registration.active?.postMessage(message);
   } catch (err) {
-    console.warn('Could not schedule service worker alarm:', err);
+    console.warn('Service Worker messaging note:', err);
   }
 }
 
 /**
- * Cancel scheduled alarm notification in Service Worker
+ * Best-effort supplementary notification scheduling in Service Worker.
+ * Note: Service Worker setTimeout is NOT guaranteed by Android/mobile OSes when
+ * the Service Worker process is terminated in the background.
+ */
+export function scheduleServiceWorkerAlarm(
+  endTime: number,
+  title?: string,
+  body?: string,
+  sessionId?: string
+) {
+  if (!isNotificationSupported() || getNotificationPermissionStatus() !== 'granted') {
+    return;
+  }
+  postMessageToServiceWorker({
+    type: 'SCHEDULE_ALARM',
+    endTime,
+    sessionId: sessionId || null,
+    title: title || 'One Tap Timer',
+    body: body || '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',
+  });
+}
+
+/**
+ * Cancels any pending Service Worker notification fallback and clears stale notifications.
  */
 export function cancelServiceWorkerAlarm() {
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
-  try {
-    if (navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage({
-        type: 'CANCEL_ALARM',
-      });
-    }
-  } catch (err) {
-    console.warn('Could not cancel service worker alarm:', err);
-  }
+  postMessageToServiceWorker({
+    type: 'CANCEL_ALARM',
+  });
 }
 
 /**
@@ -159,14 +197,16 @@ export function getNotificationPermissionStatus(): NotificationPermission | 'uns
   return Notification.permission;
 }
 
-export function sendTimerNotification(title: string, body: string) {
-  if (typeof window === 'undefined' || !('Notification' in window) || Notification.permission !== 'granted') {
-    return;
+export function sendTimerNotification(title: string, body: string): boolean {
+  if (!isNotificationSupported() || Notification.permission !== 'granted') {
+    return false;
   }
 
   try {
-    const iconUrl = 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/android-chrome-192x192.png';
-    const badgeUrl = 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon-96x96.png';
+    const iconUrl =
+      'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/android-chrome-192x192.png';
+    const badgeUrl =
+      'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon-96x96.png';
 
     const options: NotificationOptions = {
       body,
@@ -177,20 +217,26 @@ export function sendTimerNotification(title: string, body: string) {
       silent: false,
     };
 
-    if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.ready.then((registration) => {
-        registration.showNotification(title, {
-          ...options,
-          vibrate: [600, 300, 600, 300, 600, 300, 600] as unknown as number[],
-          renotify: true,
-        } as NotificationOptions);
-      }).catch(() => {
-        new Notification(title, options);
-      });
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator && navigator.serviceWorker.controller) {
+      navigator.serviceWorker.ready
+        .then((registration) => {
+          return registration.showNotification(title, {
+            ...options,
+            vibrate: [600, 300, 600, 300, 600, 300, 600] as unknown as number[],
+            renotify: true,
+          } as NotificationOptions);
+        })
+        .catch(() => {
+          try {
+            new Notification(title, options);
+          } catch {}
+        });
     } else {
       new Notification(title, options);
     }
+    return true;
   } catch (err) {
     console.warn('Notification trigger error:', err);
+    return false;
   }
 }

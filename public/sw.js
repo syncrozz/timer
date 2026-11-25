@@ -1,6 +1,11 @@
-const CACHE_NAME = 'one-tap-timer-v2';
-const ASSETS_TO_CACHE = [
+const CACHE_NAME = 'one-tap-timer-v3';
+const CORE_SHELL_ASSETS = [
   '/',
+  '/manifest.json',
+  '/site.webmanifest',
+];
+
+const OPTIONAL_ICON_ASSETS = [
   'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/android-chrome-192x192.png',
   'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/android-chrome-512x512.png',
   'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/apple-touch-icon.png',
@@ -8,26 +13,35 @@ const ASSETS_TO_CACHE = [
   'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon-32x32.png',
   'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon-16x16.png',
   'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon.ico',
-  '/site.webmanifest',
-  '/manifest.json',
-  'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/OGI/OGI.One.Tap.Timer.jpg'
+  'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/OGI/OGI.One.Tap.Timer.jpg',
 ];
+
+const ALARM_NOTIFICATION_TAG = 'one-tap-timer-finished';
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      return cache.addAll(ASSETS_TO_CACHE);
-    }).then(() => self.skipWaiting())
+    caches
+      .open(CACHE_NAME)
+      .then(async (cache) => {
+        await cache.addAll(CORE_SHELL_ASSETS);
+        await Promise.allSettled(
+          OPTIONAL_ICON_ASSETS.map((url) => cache.add(url))
+        );
+      })
+      .then(() => self.skipWaiting())
   );
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) => {
-      return Promise.all(
-        keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
-      );
-    }).then(() => self.clients.claim())
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
+        )
+      )
+      .then(() => self.clients.claim())
   );
 });
 
@@ -36,13 +50,17 @@ self.addEventListener('fetch', (event) => {
 
   event.respondWith(
     caches.match(event.request).then((cached) => {
-      const fetchPromise = fetch(event.request).then((networkResponse) => {
-        if (networkResponse && networkResponse.status === 200) {
-          const responseClone = networkResponse.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, responseClone));
-        }
-        return networkResponse;
-      }).catch(() => cached);
+      const fetchPromise = fetch(event.request)
+        .then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200) {
+            const responseClone = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(event.request, responseClone).catch(() => {});
+            });
+          }
+          return networkResponse;
+        })
+        .catch(() => cached);
 
       return cached || fetchPromise;
     })
@@ -50,55 +68,86 @@ self.addEventListener('fetch', (event) => {
 });
 
 let scheduledAlarmTimeout = null;
+let activeSessionId = null;
+
+function canShowNotification() {
+  return (
+    typeof self.Notification !== 'undefined' &&
+    self.Notification.permission === 'granted' &&
+    self.registration &&
+    typeof self.registration.showNotification === 'function'
+  );
+}
+
+async function clearTimerNotifications() {
+  if (!self.registration || typeof self.registration.getNotifications !== 'function') {
+    return;
+  }
+  try {
+    const existing = await self.registration.getNotifications({ tag: ALARM_NOTIFICATION_TAG });
+    for (const notification of existing) {
+      notification.close();
+    }
+  } catch {
+    // Ignore unsupported notification query errors
+  }
+}
+
+function clearScheduledAlarm() {
+  if (scheduledAlarmTimeout !== null) {
+    clearTimeout(scheduledAlarmTimeout);
+    scheduledAlarmTimeout = null;
+  }
+  activeSessionId = null;
+}
 
 self.addEventListener('message', (event) => {
   if (!event.data) return;
 
   if (event.data.type === 'SCHEDULE_ALARM') {
-    if (scheduledAlarmTimeout) {
-      clearTimeout(scheduledAlarmTimeout);
-      scheduledAlarmTimeout = null;
+    clearScheduledAlarm();
+
+    if (!canShowNotification()) {
+      return;
     }
 
-    const targetTime = event.data.endTime;
-    const now = Date.now();
-    const delay = Math.max(0, targetTime - now);
+    const targetTime = Number(event.data.endTime);
+    if (!Number.isFinite(targetTime) || targetTime <= 0) {
+      return;
+    }
 
-    // Try native OS TimestampTrigger (supported on Android Chrome for exact lockscreen alarm wakeup)
-    try {
-      if (typeof TimestampTrigger !== 'undefined' && 'showTrigger' in Notification.prototype) {
-        self.registration.showNotification(event.data.title || 'One Tap Timer', {
-          body: event.data.body || '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',
+    const sessionId = event.data.sessionId || `sw-${targetTime}`;
+    activeSessionId = sessionId;
+    const delay = Math.max(0, targetTime - Date.now());
+    const title = event.data.title || 'One Tap Timer';
+    const body = event.data.body || '⏰ Masa telah tamat! Jam penggera sedang berbunyi.';
+
+    // Best-effort supplementary fallback only: mobile OSes may terminate idle
+    // Service Workers after ~30s, so setTimeout does NOT guarantee exact delivery.
+    scheduledAlarmTimeout = setTimeout(async () => {
+      if (activeSessionId !== sessionId) return;
+      scheduledAlarmTimeout = null;
+      activeSessionId = null;
+
+      if (!canShowNotification()) return;
+
+      try {
+        await self.registration.showNotification(title, {
+          body,
           icon: 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/android-chrome-192x192.png',
           badge: 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon-96x96.png',
-          tag: 'one-tap-timer-finished',
-          showTrigger: new TimestampTrigger(targetTime),
+          tag: ALARM_NOTIFICATION_TAG,
           requireInteraction: true,
           vibrate: [600, 300, 600, 300, 600, 300, 600],
           renotify: true,
         });
+      } catch {
+        // Ignore notification errors if permission was revoked
       }
-    } catch (e) {
-      // Fallback to standard timer below
-    }
-
-    scheduledAlarmTimeout = setTimeout(() => {
-      self.registration.showNotification(event.data.title || 'One Tap Timer', {
-        body: event.data.body || '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',
-        icon: 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/android-chrome-192x192.png',
-        badge: 'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/OneTapTimer/favicon-96x96.png',
-        tag: 'one-tap-timer-finished',
-        requireInteraction: true,
-        vibrate: [600, 300, 600, 300, 600, 300, 600],
-        renotify: true,
-      });
-      scheduledAlarmTimeout = null;
     }, delay);
   } else if (event.data.type === 'CANCEL_ALARM') {
-    if (scheduledAlarmTimeout) {
-      clearTimeout(scheduledAlarmTimeout);
-      scheduledAlarmTimeout = null;
-    }
+    clearScheduledAlarm();
+    event.waitUntil(clearTimerNotifications());
   }
 });
 
@@ -108,6 +157,7 @@ self.addEventListener('notificationclick', (event) => {
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
       for (const client of clientList) {
         if ('focus' in client) {
+          client.postMessage({ type: 'TIMER_NOTIFICATION_CLICKED' });
           return client.focus();
         }
       }

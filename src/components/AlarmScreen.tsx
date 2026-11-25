@@ -6,6 +6,7 @@ interface AlarmScreenProps {
   onRestartTimer: () => void;
   ringtoneName: string;
   defaultMinutes: number;
+  alarmStartedAt?: number | null;
 }
 
 export const AlarmScreen: React.FC<AlarmScreenProps> = ({
@@ -13,15 +14,24 @@ export const AlarmScreen: React.FC<AlarmScreenProps> = ({
   onRestartTimer,
   ringtoneName,
   defaultMinutes,
+  alarmStartedAt,
 }) => {
-  const [elapsed, setElapsed] = useState(0);
+  const startTimeRef = React.useRef<number>(alarmStartedAt || Date.now());
+  const [elapsed, setElapsed] = useState(() =>
+    Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1000))
+  );
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      setElapsed((prev) => prev + 1);
-    }, 1000);
+    if (alarmStartedAt) {
+      startTimeRef.current = alarmStartedAt;
+    }
+    const updateElapsed = () => {
+      setElapsed(Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1000)));
+    };
+    updateElapsed();
+    const timer = setInterval(updateElapsed, 500);
     return () => clearInterval(timer);
-  }, []);
+  }, [alarmStartedAt]);
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-between p-6 bg-[#030712]/95 backdrop-blur-3xl text-white overflow-hidden">

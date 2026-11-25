@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Settings as SettingsIcon } from 'lucide-react';
-import { AppSettings, TimerState } from './types';
+import { AppSettings, TimerSession, TimerState } from './types';
 import { BUILT_IN_RINGTONES, soundEngine } from './utils/sound';
 import {
   backgroundTimer,
@@ -9,6 +9,17 @@ import {
   scheduleServiceWorkerAlarm,
   cancelServiceWorkerAlarm,
 } from './utils/backgroundTimer';
+import {
+  calculateSessionRemaining,
+  clearPersistedSession,
+  createIdleSession,
+  createRunningSession,
+  loadPersistedSession,
+  pauseRunningSession,
+  persistSession,
+  resumePausedSession,
+  tryMarkAlarmTriggered,
+} from './utils/timerSession';
 import { TimerDisplay } from './components/TimerDisplay';
 import { PresetsBar } from './components/PresetsBar';
 import { SettingsModal } from './components/SettingsModal';
@@ -31,6 +42,15 @@ const DEFAULT_SETTINGS: AppSettings = {
 
 const STORAGE_KEY = 'pemasa_1tap_settings';
 
+function formatCountdownTitle(totalSeconds: number): string {
+  const hours = Math.floor(totalSeconds / 3600);
+  const mins = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  return hours > 0
+    ? `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
+    : `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
 export default function App() {
   const [settings, setSettings] = useState<AppSettings>(() => {
     try {
@@ -44,87 +64,42 @@ export default function App() {
     return DEFAULT_SETTINGS;
   });
 
-  const defaultTotalSeconds = settings.defaultMinutes * 60 + settings.defaultSeconds;
+  const settingsRef = useRef<AppSettings>(settings);
+  settingsRef.current = settings;
 
-  const [totalDurationSeconds, setTotalDurationSeconds] = useState(defaultTotalSeconds);
-  const [timeLeftSeconds, setTimeLeftSeconds] = useState(defaultTotalSeconds);
-  const [timerState, setTimerState] = useState<TimerState>('idle');
+  const defaultTotalSeconds = Math.max(1, settings.defaultMinutes * 60 + settings.defaultSeconds);
+
+  // Authoritative session initialized synchronously from persisted storage
+  const initialSessionRef = useRef<TimerSession | null>(null);
+  if (initialSessionRef.current === null) {
+    initialSessionRef.current = loadPersistedSession(defaultTotalSeconds);
+  }
+  const sessionRef = useRef<TimerSession>(initialSessionRef.current);
+
+  const initialRemaining = calculateSessionRemaining(sessionRef.current, Date.now());
+
+  const [totalDurationSeconds, setTotalDurationSeconds] = useState<number>(
+    sessionRef.current.status === 'idle' ? defaultTotalSeconds : sessionRef.current.durationSeconds
+  );
+  const [timeLeftSeconds, setTimeLeftSeconds] = useState<number>(initialRemaining.remainingSeconds);
+  const [timerState, setTimerState] = useState<TimerState>(sessionRef.current.status);
+  const [alarmStartedAt, setAlarmStartedAt] = useState<number | null>(
+    sessionRef.current.alarmTriggeredAt
+  );
   const [showSettings, setShowSettings] = useState(false);
   const [isSupportOpen, setIsSupportOpen] = useState(() => {
     return typeof window !== 'undefined' && window.location.hash === '#support';
   });
 
-  const endTimeRef = useRef<number | null>(null);
-
-  // Restore running timer from localStorage if page was refreshed or restored after background swap
+  // Preload selected ringtone whenever settings change or on mount
   useEffect(() => {
-    try {
-      const savedEndTime = localStorage.getItem('pemasa_target_end_time');
-      const savedState = localStorage.getItem('pemasa_timer_state');
-      const savedTotal = localStorage.getItem('pemasa_total_duration');
-
-      if (savedTotal) {
-        const parsedTotal = parseInt(savedTotal, 10);
-        if (!isNaN(parsedTotal) && parsedTotal > 0) {
-          setTotalDurationSeconds(parsedTotal);
-        }
-      }
-
-      if (savedState === 'running' && savedEndTime) {
-        const end = parseInt(savedEndTime, 10);
-        if (!isNaN(end)) {
-          const remaining = Math.max(0, Math.ceil((end - Date.now()) / 1000));
-          if (remaining > 0) {
-            endTimeRef.current = end;
-            setTimeLeftSeconds(remaining);
-            setTimerState('running');
-            soundEngine.armTimer(
-              settings.ringtoneId,
-              settings.customRingtoneDataUrl,
-              settings.volume,
-              end,
-              () => {
-                setTimeLeftSeconds(0);
-                setTimerState('finished');
-                screenWakeManager.release();
-                soundEngine.playAlarm(
-                  settings.ringtoneId,
-                  settings.customRingtoneDataUrl,
-                  settings.volume
-                );
-              }
-            );
-          } else {
-            // Time expired while away
-            setTimeLeftSeconds(0);
-            setTimerState('finished');
-            screenWakeManager.release();
-            soundEngine.playAlarm(
-              settings.ringtoneId,
-              settings.customRingtoneDataUrl,
-              settings.volume
-            );
-            if (settings.vibrate) {
-              soundEngine.startVibrationLoop([600, 300, 600, 300, 600, 300, 600]);
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.warn('Failed to restore active timer:', e);
-    }
-  }, [settings.ringtoneId, settings.customRingtoneDataUrl, settings.volume, settings.vibrate]);
+    soundEngine.preloadRingtone(settings.ringtoneId, settings.customRingtoneDataUrl);
+  }, [settings.ringtoneId, settings.customRingtoneDataUrl]);
 
   // Keep browser tab title synchronized with countdown
   useEffect(() => {
     if (timerState === 'running') {
-      const hours = Math.floor(timeLeftSeconds / 3600);
-      const mins = Math.floor((timeLeftSeconds % 3600) / 60);
-      const secs = timeLeftSeconds % 60;
-      const timeStr = hours > 0
-        ? `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
-        : `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-      document.title = `${timeStr} - One Tap Timer`;
+      document.title = `${formatCountdownTitle(timeLeftSeconds)} - One Tap Timer`;
     } else if (timerState === 'finished') {
       document.title = '⏰ Masa Tamat! - One Tap Timer';
     } else if (timerState === 'paused') {
@@ -159,58 +134,80 @@ export default function App() {
 
   const handleSaveSettings = (newSettings: AppSettings) => {
     setSettings(newSettings);
+    settingsRef.current = newSettings;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(newSettings));
     } catch (e) {
       console.error('Failed to save settings:', e);
     }
 
-    if (timerState === 'idle') {
-      const newTotal = newSettings.defaultMinutes * 60 + newSettings.defaultSeconds;
+    if (sessionRef.current.status === 'idle') {
+      const newTotal = Math.max(1, newSettings.defaultMinutes * 60 + newSettings.defaultSeconds);
+      const idle = createIdleSession(newTotal);
+      sessionRef.current = idle;
       setTotalDurationSeconds(newTotal);
       setTimeLeftSeconds(newTotal);
     }
   };
 
-  const triggerAlarm = useCallback(() => {
-    endTimeRef.current = null;
-    try {
-      localStorage.removeItem('pemasa_target_end_time');
-      localStorage.setItem('pemasa_timer_state', 'finished');
-    } catch {}
-
-    setTimeLeftSeconds(0);
-    setTimerState('finished');
-    screenWakeManager.release();
-    backgroundTimer.stop();
-
-    soundEngine.playAlarm(
-      settings.ringtoneId,
-      settings.customRingtoneDataUrl,
-      settings.volume
+  /**
+   * Single authoritative alarm trigger protected by `tryMarkAlarmTriggered`.
+   * Guarantees at most ONE alarm playback + notification per timer session.
+   */
+  const triggerAlarm = useCallback((expectedSessionId?: string) => {
+    const now = Date.now();
+    const { shouldTrigger, session: nextSession } = tryMarkAlarmTriggered(
+      sessionRef.current,
+      now,
+      expectedSessionId
     );
 
-    if (settings.vibrate) {
-      soundEngine.startVibrationLoop([600, 300, 600, 300, 600, 300, 600]);
+    if (!shouldTrigger) {
+      return;
     }
 
-    if (settings.backgroundNotifications) {
-      sendTimerNotification('One Tap Timer', '⏰ Masa telah tamat! Jam penggera sedang berbunyi.');
-    }
-  }, [settings]);
+    sessionRef.current = nextSession;
+    persistSession(nextSession);
 
-  const handleStopAlarm = useCallback(() => {
-    soundEngine.stop();
+    backgroundTimer.stop();
     screenWakeManager.release();
     cancelServiceWorkerAlarm();
-    endTimeRef.current = null;
-    try {
-      localStorage.removeItem('pemasa_target_end_time');
-      localStorage.removeItem('pemasa_timer_state');
-    } catch {}
+
+    setTimeLeftSeconds(0);
+    setAlarmStartedAt(nextSession.alarmTriggeredAt ?? now);
+    setTimerState('finished');
+
+    const activeSettings = settingsRef.current;
+    soundEngine.playAlarm(
+      activeSettings.ringtoneId,
+      activeSettings.customRingtoneDataUrl,
+      activeSettings.volume,
+      { vibrate: activeSettings.vibrate }
+    );
+
+    if (activeSettings.backgroundNotifications) {
+      sendTimerNotification('One Tap Timer', '⏰ Masa telah tamat! Jam penggera sedang berbunyi.');
+    }
+  }, []);
+
+  const clearToIdle = useCallback((resetDurationSeconds: number) => {
+    soundEngine.stop();
+    backgroundTimer.stop();
+    screenWakeManager.release();
+    cancelServiceWorkerAlarm();
+
+    const idle = createIdleSession(resetDurationSeconds);
+    sessionRef.current = idle;
+    clearPersistedSession();
+
+    setAlarmStartedAt(null);
     setTimerState('idle');
-    setTimeLeftSeconds(totalDurationSeconds);
-  }, [totalDurationSeconds]);
+    setTimeLeftSeconds(idle.durationSeconds);
+  }, []);
+
+  const handleStopAlarm = useCallback(() => {
+    clearToIdle(totalDurationSeconds);
+  }, [clearToIdle, totalDurationSeconds]);
 
   // Connect MediaSession lockscreen controls to handleStopAlarm
   useEffect(() => {
@@ -220,131 +217,225 @@ export default function App() {
     };
   }, [handleStopAlarm]);
 
-  const startTimer = useCallback((secondsToRun: number) => {
-    soundEngine.unlockAudio();
-    if (settings.keepScreenAwake) {
-      screenWakeManager.activate();
-    }
-    if (settings.backgroundNotifications) {
-      requestNotificationPermission().catch(() => {});
-    }
+  const startSessionWithDuration = useCallback(
+    (runSeconds: number, totalSecondsForProgress: number, existingPausedSession?: TimerSession) => {
+      const activeSettings = settingsRef.current;
+      soundEngine.unlockAudio();
+      soundEngine.preloadRingtone(activeSettings.ringtoneId, activeSettings.customRingtoneDataUrl);
 
-    const end = Date.now() + secondsToRun * 1000;
-    endTimeRef.current = end;
+      if (activeSettings.keepScreenAwake) {
+        screenWakeManager.activate();
+      }
+      if (activeSettings.backgroundNotifications) {
+        requestNotificationPermission().catch(() => {});
+      }
 
-    // Arm audio keep-alive and pre-play chosen alarm tone on this user interaction
-    soundEngine.armTimer(
-      settings.ringtoneId,
-      settings.customRingtoneDataUrl,
-      settings.volume,
-      end,
-      triggerAlarm
-    );
+      const now = Date.now();
+      const nextSession = existingPausedSession
+        ? resumePausedSession(existingPausedSession, now)
+        : createRunningSession(runSeconds, now, totalSecondsForProgress);
 
-    try {
-      localStorage.setItem('pemasa_target_end_time', String(end));
-      localStorage.setItem('pemasa_total_duration', String(totalDurationSeconds));
-      localStorage.setItem('pemasa_timer_state', 'running');
-    } catch {}
+      sessionRef.current = nextSession;
+      persistSession(nextSession);
 
-    // Schedule Service Worker alarm notification fallback
-    scheduleServiceWorkerAlarm(
-      end,
-      'One Tap Timer',
-      '⏰ Masa telah tamat! Jam penggera sedang berbunyi.'
-    );
+      const { remainingSeconds } = calculateSessionRemaining(nextSession, now);
+      setTotalDurationSeconds(nextSession.durationSeconds);
+      setTimeLeftSeconds(remainingSeconds);
+      setAlarmStartedAt(null);
 
-    setTimerState('running');
-  }, [settings, totalDurationSeconds, triggerAlarm]);
+      if (nextSession.targetEndTime !== null) {
+        soundEngine.armTimer(
+          activeSettings.ringtoneId,
+          activeSettings.customRingtoneDataUrl,
+          activeSettings.volume,
+          nextSession.targetEndTime,
+          () => triggerAlarm(nextSession.sessionId)
+        );
+
+        if (activeSettings.backgroundNotifications) {
+          scheduleServiceWorkerAlarm(
+            nextSession.targetEndTime,
+            'One Tap Timer',
+            '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',
+            nextSession.sessionId
+          );
+        }
+      }
+
+      setTimerState('running');
+    },
+    [triggerAlarm]
+  );
 
   const pauseTimer = useCallback(() => {
+    const now = Date.now();
+    const { session: pausedSession, expired } = pauseRunningSession(sessionRef.current, now);
+    if (expired) {
+      triggerAlarm(sessionRef.current.sessionId);
+      return;
+    }
+
     soundEngine.disarmKeepAlive();
+    backgroundTimer.stop();
     screenWakeManager.release();
     cancelServiceWorkerAlarm();
-    if (endTimeRef.current !== null) {
-      const remaining = Math.max(0, Math.ceil((endTimeRef.current - Date.now()) / 1000));
-      setTimeLeftSeconds(remaining);
-    }
-    endTimeRef.current = null;
-    try {
-      localStorage.removeItem('pemasa_target_end_time');
-      localStorage.setItem('pemasa_timer_state', 'paused');
-    } catch {}
-    setTimerState('paused');
-  }, []);
 
-  // Main countdown engine (Web Worker + audio timeupdate + timestamp-based delta calculations)
+    sessionRef.current = pausedSession;
+    persistSession(pausedSession);
+
+    const { remainingSeconds } = calculateSessionRemaining(pausedSession, now);
+    setTimeLeftSeconds(remainingSeconds);
+    setTimerState('paused');
+  }, [triggerAlarm]);
+
+  /**
+   * Authoritative timestamp reconciliation: reads `sessionRef.current`,
+   * recalculates remaining time via `Date.now()`, updates UI immediately,
+   * and triggers alarm once if `targetEndTime` has passed.
+   */
+  const reconcileTimer = useCallback(() => {
+    const current = sessionRef.current;
+    if (current.status !== 'running' || current.targetEndTime === null) {
+      return;
+    }
+
+    const now = Date.now();
+    const { remainingMs, remainingSeconds, isExpired } = calculateSessionRemaining(current, now);
+
+    setTimeLeftSeconds(remainingSeconds);
+    soundEngine.updateMediaSessionRunning(formatCountdownTitle(remainingSeconds));
+
+    if (isExpired || remainingMs <= 0) {
+      triggerAlarm(current.sessionId);
+    }
+  }, [triggerAlarm]);
+
+  // One-time startup recovery for a running timer restored from localStorage
   useEffect(() => {
-    if (timerState !== 'running' || endTimeRef.current === null) {
+    const restored = sessionRef.current;
+    if (restored.status !== 'running' || restored.targetEndTime === null) {
+      return;
+    }
+
+    const activeSettings = settingsRef.current;
+    const { isExpired } = calculateSessionRemaining(restored, Date.now());
+    if (isExpired) {
+      triggerAlarm(restored.sessionId);
+      return;
+    }
+
+    if (activeSettings.keepScreenAwake) {
+      screenWakeManager.activate();
+    }
+
+    soundEngine.armTimer(
+      activeSettings.ringtoneId,
+      activeSettings.customRingtoneDataUrl,
+      activeSettings.volume,
+      restored.targetEndTime,
+      () => triggerAlarm(restored.sessionId)
+    );
+
+    if (activeSettings.backgroundNotifications) {
+      scheduleServiceWorkerAlarm(
+        restored.targetEndTime,
+        'One Tap Timer',
+        '⏰ Masa telah tamat! Jam penggera sedang berbunyi.',
+        restored.sessionId
+      );
+    }
+  }, [triggerAlarm]);
+
+  // Countdown tick engine (Web Worker + timestamp-based main-thread reconciliation)
+  useEffect(() => {
+    if (timerState !== 'running' || sessionRef.current.targetEndTime === null) {
       backgroundTimer.stop();
       return;
     }
 
+    const activeSessionId = sessionRef.current.sessionId;
+    const targetEndTime = sessionRef.current.targetEndTime;
+
     if (settings.keepScreenAwake) {
       screenWakeManager.activate();
     }
 
-    const checkTimeRemaining = () => {
-      if (endTimeRef.current === null) return;
-      const now = Date.now();
-      const remainingMs = endTimeRef.current - now;
-      const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
+    reconcileTimer();
 
-      setTimeLeftSeconds(remainingSec);
+    backgroundTimer.start(reconcileTimer, targetEndTime, () => triggerAlarm(activeSessionId));
+    const fallbackInterval = window.setInterval(reconcileTimer, 200);
 
-      const hours = Math.floor(remainingSec / 3600);
-      const mins = Math.floor((remainingSec % 3600) / 60);
-      const secs = remainingSec % 60;
-      const timeStr = hours > 0
-        ? `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`
-        : `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-      soundEngine.updateMediaSessionRunning(timeStr);
+    return () => {
+      backgroundTimer.stop();
+      clearInterval(fallbackInterval);
+    };
+  }, [timerState, settings.keepScreenAwake, reconcileTimer, triggerAlarm]);
 
-      if (remainingMs <= 0) {
-        triggerAlarm();
+  // Comprehensive Lifecycle Recovery: visibilitychange, pageshow, pagehide, focus, resume, freeze
+  useEffect(() => {
+    const handleBecomeActive = () => {
+      reconcileTimer();
+
+      const current = sessionRef.current;
+      if (current.status === 'running') {
+        if (settingsRef.current.keepScreenAwake) {
+          screenWakeManager.reacquireIfVisible();
+        }
+        soundEngine.resumeAudioIfNeeded();
       }
     };
 
-    // Immediate check
-    checkTimeRemaining();
-
-    // Start background Web Worker timer with target timestamp
-    backgroundTimer.start(checkTimeRemaining, endTimeRef.current, triggerAlarm);
-
-    // Fallback interval on main thread
-    const fallbackInterval = window.setInterval(checkTimeRemaining, 200);
-
-    // Reconcile immediately upon tab swap, app focus, or visibility change
-    const onVisibilityChange = () => {
-      if (!settings.backgroundTimer && document.hidden && timerState === 'running') {
-        pauseTimer();
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        handleBecomeActive();
       } else {
-        checkTimeRemaining();
-        if (document.visibilityState === 'visible' && settings.keepScreenAwake && timerState === 'running') {
-          screenWakeManager.activate();
+        const current = sessionRef.current;
+        if (current.status === 'running') {
+          if (!settingsRef.current.backgroundTimer) {
+            pauseTimer();
+          } else {
+            persistSession(current);
+          }
         }
       }
     };
 
-    const onWindowFocus = () => {
-      checkTimeRemaining();
-      if (document.visibilityState === 'visible' && settings.keepScreenAwake && timerState === 'running') {
-        screenWakeManager.activate();
+    const handleBecomeInactive = () => {
+      const current = sessionRef.current;
+      if (current.status === 'running') {
+        persistSession(current);
       }
     };
 
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    window.addEventListener('focus', onWindowFocus);
-    window.addEventListener('pageshow', onWindowFocus);
+    const handleServiceWorkerMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'TIMER_NOTIFICATION_CLICKED') {
+        handleBecomeActive();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    document.addEventListener('resume', handleBecomeActive);
+    document.addEventListener('freeze', handleBecomeInactive);
+    window.addEventListener('pageshow', handleBecomeActive);
+    window.addEventListener('pagehide', handleBecomeInactive);
+    window.addEventListener('focus', handleBecomeActive);
+
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+    }
 
     return () => {
-      backgroundTimer.stop();
-      if (fallbackInterval) clearInterval(fallbackInterval);
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-      window.removeEventListener('focus', onWindowFocus);
-      window.removeEventListener('pageshow', onWindowFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      document.removeEventListener('resume', handleBecomeActive);
+      document.removeEventListener('freeze', handleBecomeInactive);
+      window.removeEventListener('pageshow', handleBecomeActive);
+      window.removeEventListener('pagehide', handleBecomeInactive);
+      window.removeEventListener('focus', handleBecomeActive);
+      if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+        navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+      }
     };
-  }, [timerState, settings, pauseTimer, triggerAlarm]);
+  }, [pauseTimer, reconcileTimer]);
 
   const handleMainTap = () => {
     soundEngine.unlockAudio();
@@ -352,49 +443,36 @@ export default function App() {
       soundEngine.vibrate(30);
     }
 
-    if (timerState === 'idle') {
-      if (settings.keepScreenAwake) {
-        screenWakeManager.activate();
-      }
-      startTimer(totalDurationSeconds);
-    } else if (timerState === 'running') {
-      screenWakeManager.release();
+    const current = sessionRef.current;
+    if (current.status === 'idle') {
+      startSessionWithDuration(totalDurationSeconds, totalDurationSeconds);
+    } else if (current.status === 'running') {
       pauseTimer();
-    } else if (timerState === 'paused') {
-      if (settings.keepScreenAwake) {
-        screenWakeManager.activate();
-      }
-      startTimer(timeLeftSeconds);
-    } else if (timerState === 'finished') {
-      screenWakeManager.release();
+    } else if (current.status === 'paused') {
+      const resumeSeconds = current.pausedRemainingSeconds ?? timeLeftSeconds;
+      startSessionWithDuration(resumeSeconds, current.durationSeconds, current);
+    } else if (current.status === 'finished') {
       handleStopAlarm();
     }
   };
 
   const handleReset = () => {
-    soundEngine.stop();
-    screenWakeManager.release();
-    cancelServiceWorkerAlarm();
-    endTimeRef.current = null;
-    try {
-      localStorage.removeItem('pemasa_target_end_time');
-      localStorage.removeItem('pemasa_timer_state');
-    } catch {}
-    setTimerState('idle');
-    setTimeLeftSeconds(totalDurationSeconds);
+    clearToIdle(totalDurationSeconds);
   };
 
   const handleRestartTimer = () => {
     soundEngine.stop();
+    backgroundTimer.stop();
     screenWakeManager.release();
     cancelServiceWorkerAlarm();
-    setTimeLeftSeconds(totalDurationSeconds);
-    startTimer(totalDurationSeconds);
+    startSessionWithDuration(totalDurationSeconds, totalDurationSeconds);
   };
 
   const handleSelectPreset = (mins: number, secs: number) => {
-    if (timerState !== 'idle') return;
-    const newTotal = mins * 60 + secs;
+    if (sessionRef.current.status !== 'idle') return;
+    const newTotal = Math.max(1, mins * 60 + secs);
+    const idle = createIdleSession(newTotal);
+    sessionRef.current = idle;
     setTotalDurationSeconds(newTotal);
     setTimeLeftSeconds(newTotal);
   };
@@ -520,6 +598,7 @@ export default function App() {
           onRestartTimer={handleRestartTimer}
           ringtoneName={getRingtoneDisplayName()}
           defaultMinutes={settings.defaultMinutes}
+          alarmStartedAt={alarmStartedAt}
         />
       )}
     </div>

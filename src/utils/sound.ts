@@ -69,7 +69,8 @@ export const BUILT_IN_RINGTONES: RingtoneOption[] = [
 /**
  * Generates a clean 16-bit 44.1kHz silent WAV PCM audio buffer (pure digital zero).
  * Keeps the browser/OS audio session, MediaSession, and `ontimeupdate` heartbeat active
- * in the background without producing any audible hiss, quantization noise, or hum.
+ * when the browser allows background audio, without producing audible hiss or hum.
+ * Note: Mobile OSes may still suspend browser processes after screen lock.
  */
 function createSilentWavBlobUrl(): string {
   try {
@@ -101,7 +102,6 @@ function createSilentWavBlobUrl(): string {
     view.setUint16(34, bitsPerSample, true);
     writeString(36, 'data');
     view.setUint32(40, dataSize, true);
-    // ArrayBuffer is zero-initialized, producing pure 16-bit digital silence (0x0000)
 
     const blob = new Blob([buffer], { type: 'audio/wav' });
     return URL.createObjectURL(blob);
@@ -111,10 +111,15 @@ function createSilentWavBlobUrl(): string {
   }
 }
 
+export interface PlayAlarmOptions {
+  vibrate?: boolean;
+}
+
 class SoundEngine {
   private silentWavUrl: string = '';
   private keepAliveAudio: HTMLAudioElement | null = null;
   private alarmAudio: HTMLAudioElement | null = null;
+  private preloadedUrl: string | null = null;
   private audioContext: AudioContext | null = null;
   private keepAliveSource: AudioBufferSourceNode | null = null;
   private keepAliveGain: GainNode | null = null;
@@ -124,6 +129,7 @@ class SoundEngine {
   private onExpiredAction: (() => void) | null = null;
   private targetEndTime: number | null = null;
   private isArmed = false;
+  private isAlarmPlaying = false;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -135,8 +141,12 @@ class SoundEngine {
     this.onStopAction = callback;
   }
 
+  public isPlayingAlarm(): boolean {
+    return this.isAlarmPlaying;
+  }
+
   /**
-   * Unlocks AudioContext during user gesture
+   * Unlocks or resumes AudioContext during user gesture or lifecycle recovery
    */
   public unlockAudio() {
     try {
@@ -151,6 +161,15 @@ class SoundEngine {
       }
     } catch (e) {
       console.warn('AudioContext unlock note:', e);
+    }
+  }
+
+  public resumeAudioIfNeeded() {
+    if (this.audioContext && this.audioContext.state === 'suspended') {
+      this.audioContext.resume().catch(() => {});
+    }
+    if (this.isArmed && this.keepAliveAudio && this.keepAliveAudio.paused) {
+      this.keepAliveAudio.play().catch(() => {});
     }
   }
 
@@ -169,53 +188,83 @@ class SoundEngine {
   }
 
   /**
-   * Arms the active background audio keep-alive and preloads alarm tone.
-   * Plays a pure silent WAV stream and silent Web Audio buffer so the OS keeps
-   * the timer thread active without emitting any audible hiss or hum.
+   * Preloads the selected ringtone into an HTMLAudioElement before the timer starts.
+   */
+  public preloadRingtone(ringtoneId: string, customDataUrl?: string) {
+    if (typeof Audio === 'undefined') return;
+    try {
+      const url = this.getAudioUrl(ringtoneId, customDataUrl);
+      if (!url) return;
+
+      if (!this.alarmAudio) {
+        this.alarmAudio = new Audio();
+      }
+      this.alarmAudio.setAttribute('playsinline', '');
+      this.alarmAudio.setAttribute('webkit-playsinline', '');
+      this.alarmAudio.preload = 'auto';
+      this.alarmAudio.loop = true;
+
+      if (this.preloadedUrl !== url) {
+        this.alarmAudio.src = url;
+        this.alarmAudio.load();
+        this.preloadedUrl = url;
+      }
+    } catch (err) {
+      console.warn('Alarm audio preload warning:', err);
+    }
+  }
+
+  /**
+   * Arms the supplementary background audio keep-alive and preloads alarm tone.
+   * `ontimeupdate` delegates strictly to `onExpired` so expiration goes through
+   * the single authoritative session guard (preventing duplicate alarm playback).
    */
   public armTimer(
     ringtoneId: string,
     customDataUrl?: string,
-    volume = 0.8,
+    _volume = 0.8,
     targetEndTime?: number,
     onExpired?: () => void
   ) {
     this.isArmed = true;
+    this.isAlarmPlaying = false;
     this.targetEndTime = targetEndTime || null;
     this.onExpiredAction = onExpired || null;
     this.unlockAudio();
 
-    // 1. Start continuous silent carrier audio on loop
+    // 1. Pre-load the chosen alarm ringtone before starting
+    this.preloadRingtone(ringtoneId, customDataUrl);
+
+    // 2. Start continuous silent carrier audio on loop (supplementary keep-alive)
     try {
-      if (!this.keepAliveAudio) {
-        this.keepAliveAudio = new Audio(this.silentWavUrl);
-      }
-      this.keepAliveAudio.setAttribute('playsinline', '');
-      this.keepAliveAudio.setAttribute('webkit-playsinline', '');
-      this.keepAliveAudio.loop = true;
-      // Non-zero volume ensures OS treats stream as unmuted active media, while PCM samples are pure zero
-      this.keepAliveAudio.volume = 0.01;
-
-      // Monitor targetEndTime on every OS audio timeupdate
-      this.keepAliveAudio.ontimeupdate = () => {
-        if (!this.isArmed || !this.targetEndTime) return;
-        if (Date.now() >= this.targetEndTime) {
-          this.playAlarm(ringtoneId, customDataUrl, volume);
-          if (this.onExpiredAction) {
-            this.onExpiredAction();
-          }
+      if (typeof Audio !== 'undefined') {
+        if (!this.keepAliveAudio) {
+          this.keepAliveAudio = new Audio(this.silentWavUrl);
         }
-      };
+        this.keepAliveAudio.setAttribute('playsinline', '');
+        this.keepAliveAudio.setAttribute('webkit-playsinline', '');
+        this.keepAliveAudio.loop = true;
+        this.keepAliveAudio.volume = 0.01;
 
-      const p = this.keepAliveAudio.play();
-      if (p !== undefined) {
-        p.catch((err) => console.warn('Carrier play note:', err));
+        this.keepAliveAudio.ontimeupdate = () => {
+          if (!this.isArmed || !this.targetEndTime || this.isAlarmPlaying) return;
+          if (Date.now() >= this.targetEndTime) {
+            const cb = this.onExpiredAction;
+            this.onExpiredAction = null;
+            if (cb) cb();
+          }
+        };
+
+        const p = this.keepAliveAudio.play();
+        if (p !== undefined) {
+          p.catch((err) => console.warn('Carrier play note:', err));
+        }
       }
     } catch (err) {
       console.warn('Keep-alive init warning:', err);
     }
 
-    // 2. Start silent Web Audio keep-alive buffer (zero audible signal)
+    // 3. Start silent Web Audio keep-alive buffer (zero audible signal)
     try {
       if (this.audioContext && !this.keepAliveSource) {
         const silentBuffer = this.audioContext.createBuffer(
@@ -241,27 +290,12 @@ class SoundEngine {
       console.warn('Web Audio buffer keep-alive note:', e);
     }
 
-    // 3. Pre-load the chosen alarm ringtone so it is ready in memory
-    try {
-      const url = this.getAudioUrl(ringtoneId, customDataUrl);
-      if (!this.alarmAudio) {
-        this.alarmAudio = new Audio();
-      }
-      this.alarmAudio.setAttribute('playsinline', '');
-      this.alarmAudio.setAttribute('webkit-playsinline', '');
-      this.alarmAudio.src = url;
-      this.alarmAudio.preload = 'auto';
-      this.alarmAudio.loop = true;
-      this.alarmAudio.load();
-    } catch (err) {
-      console.warn('Alarm audio preload warning:', err);
-    }
-
     this.updateMediaSessionRunning('Pemasa sedang berjalan...');
   }
 
   public disarmKeepAlive() {
     this.isArmed = false;
+    this.onExpiredAction = null;
     if (this.keepAliveAudio) {
       this.keepAliveAudio.ontimeupdate = null;
       try {
@@ -317,13 +351,23 @@ class SoundEngine {
   }
 
   /**
-   * Plays selected alarm sound on loop and triggers hardware oscillator fallback + vibration
+   * Plays selected alarm sound on loop and triggers oscillator fallback + optional vibration.
+   * Guarded by `isAlarmPlaying` to guarantee no duplicate audio or vibration loops.
    */
-  public playAlarm(ringtoneId: string, customDataUrl?: string, volume = 0.8) {
+  public playAlarm(
+    ringtoneId: string,
+    customDataUrl?: string,
+    volume = 0.8,
+    options: PlayAlarmOptions = {}
+  ) {
+    if (this.isAlarmPlaying) {
+      return;
+    }
+    this.isAlarmPlaying = true;
     this.disarmKeepAlive();
     this.stopFallbackBeep();
 
-    const safeVolume = Math.max(0.1, Math.min(1, volume));
+    const safeVolume = Math.max(0.05, Math.min(1, volume));
     const url = this.getAudioUrl(ringtoneId, customDataUrl);
 
     // Update Lock Screen controls to alarming state
@@ -356,30 +400,39 @@ class SoundEngine {
 
     // 2. Play primary ringtone audio file
     try {
-      if (!this.alarmAudio) {
-        this.alarmAudio = new Audio();
-      }
-      this.alarmAudio.setAttribute('playsinline', '');
-      this.alarmAudio.setAttribute('webkit-playsinline', '');
-      if (this.alarmAudio.src !== url) {
-        this.alarmAudio.src = url;
-      }
-      this.alarmAudio.loop = true;
-      this.alarmAudio.volume = safeVolume;
-      this.alarmAudio.currentTime = 0;
+      if (typeof Audio !== 'undefined') {
+        if (!this.alarmAudio) {
+          this.alarmAudio = new Audio();
+        }
+        this.alarmAudio.setAttribute('playsinline', '');
+        this.alarmAudio.setAttribute('webkit-playsinline', '');
+        if (this.preloadedUrl !== url) {
+          this.alarmAudio.src = url;
+          this.preloadedUrl = url;
+        }
+        this.alarmAudio.loop = true;
+        this.alarmAudio.volume = safeVolume;
+        try {
+          this.alarmAudio.currentTime = 0;
+        } catch {}
 
-      const p = this.alarmAudio.play();
-      if (p !== undefined) {
-        p.catch((err) => {
-          console.warn('Alarm audio file play note (fallback beep active):', err);
-        });
+        const p = this.alarmAudio.play();
+        if (p !== undefined) {
+          p.catch((err) => {
+            console.warn('Alarm audio file play note (fallback beep active):', err);
+          });
+        }
       }
     } catch (err) {
       console.warn('Alarm audio play error:', err);
     }
 
-    // 3. Start looping vibration pattern
-    this.startVibrationLoop([800, 300, 800, 300, 800, 300, 800]);
+    // 3. Start looping vibration pattern only when enabled
+    if (options.vibrate !== false) {
+      this.startVibrationLoop([800, 300, 800, 300, 800, 300, 800]);
+    } else {
+      this.stopVibration();
+    }
   }
 
   /**
@@ -421,7 +474,7 @@ class SoundEngine {
   }
 
   public stopFallbackBeep() {
-    if (this.fallbackOscInterval) {
+    if (this.fallbackOscInterval !== null) {
       clearInterval(this.fallbackOscInterval);
       this.fallbackOscInterval = null;
     }
@@ -434,13 +487,14 @@ class SoundEngine {
     this.stop();
 
     const url = this.getAudioUrl(ringtoneId, customDataUrl);
-    if (!url) return;
+    if (!url || typeof Audio === 'undefined') return;
 
     try {
       const audio = new Audio(url);
       audio.loop = false;
-      audio.volume = Math.max(0, Math.min(1, volume));
+      audio.volume = Math.max(0.05, Math.min(1, volume));
       this.alarmAudio = audio;
+      this.preloadedUrl = url;
 
       const playPromise = audio.play();
       if (playPromise !== undefined) {
@@ -456,7 +510,7 @@ class SoundEngine {
   }
 
   public vibrate(pattern: number | number[] = 30) {
-    if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
       try {
         navigator.vibrate(pattern);
       } catch {}
@@ -465,7 +519,7 @@ class SoundEngine {
 
   public startVibrationLoop(pattern = [600, 300, 600, 300, 600]) {
     this.stopVibration();
-    if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
       try {
         navigator.vibrate(pattern);
         const duration = pattern.reduce((sum, val) => sum + val, 0) + 400;
@@ -479,11 +533,11 @@ class SoundEngine {
   }
 
   public stopVibration() {
-    if (this.vibrationInterval) {
+    if (this.vibrationInterval !== null) {
       clearInterval(this.vibrationInterval);
       this.vibrationInterval = null;
     }
-    if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
       try {
         navigator.vibrate(0);
       } catch {}
@@ -491,10 +545,11 @@ class SoundEngine {
   }
 
   /**
-   * Complete stop of all sounds and vibrations
+   * Complete stop of all sounds, keep-alives, and vibrations
    */
   public stop() {
     this.isArmed = false;
+    this.isAlarmPlaying = false;
     this.targetEndTime = null;
     this.disarmKeepAlive();
     this.stopFallbackBeep();

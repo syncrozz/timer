@@ -31,3 +31,17 @@ export interface TimerPreset {
   minutes: number;
   seconds: number;
 }
+
+export interface TimerSession {
+  sessionId: string;
+  status: TimerState;
+  durationSeconds: number;
+  targetEndTime: number | null;
+  pausedRemainingSeconds: number | null;
+  alarmTriggered: boolean;
+  alarmTriggeredAt: number | null;
+  updatedAt: number;
+}
+
+export type WakeLockMode = 'native' | 'nosleep' | 'inactive' | 'unsupported' | 'error';
+

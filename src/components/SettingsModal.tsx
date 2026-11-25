@@ -84,7 +84,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       backgroundTimer,
       backgroundNotifications,
       theme,
-      autoRestart: false,
+      autoRestart: settings.autoRestart ?? false,
     });
     onClose();
   };
